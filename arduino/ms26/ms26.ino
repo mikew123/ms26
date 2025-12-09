@@ -8,6 +8,7 @@
 #include "RP2040_PWM.h"
 #include "Adafruit_VL6180X.h"
 #include <Arduino_LSM6DS3.h>
+#include <atomic>
 
 // On board RGB LED 
 #define NEO 16
@@ -109,7 +110,7 @@ void MotorDrivePct(float pctL, float pctR) {
 }
 
 /////////////// I2C ///////////////////////////
-void InitI2c(int hz = 100000) {
+void Core2_InitI2c(int hz = 100000) {
   Wire.setClock(hz);
   Wire.setSCL(SCL0);
   Wire.setSDA(SDA0);
@@ -117,30 +118,69 @@ void InitI2c(int hz = 100000) {
 }
 
 /////////////// TOF sensor ////////////////////
+// TOF sensor read and processed in core 2
 Adafruit_VL6180X vl = Adafruit_VL6180X();
 
-void InitTof() {
+// buffer range data for inter-process transfer
+#define TOFSTRUCT_LEN 2
+volatile uint8_t tofStructWrIdx = 0;
+volatile uint8_t tofStructRdIdx = 0;
+volatile std::atomic<uint8_t> tofStructCnt = 0;
+volatile struct {
+  uint8_t range = 255;
+} tofStruct[TOFSTRUCT_LEN];
+uint8_t currentRange = 255;
+
+void Core2_InitTof() {
   Serial.println("Adafruit VL6180x TOF sensor init");
   if (! vl.begin(&Wire)) {
     Serial.println("Failed to find TOF sensor");
     while (1);
   }
   Serial.println("TOF sensor found!");
+  for(int i=0; i<TOFSTRUCT_LEN; i++) {
+    tofStruct[i].range = 255;
+  }
+  tofStructCnt = 0; /* atomic */
+  tofStructWrIdx = tofStructRdIdx = 0;
 }
 
-// Returns range in mm (typ 0 to 200), 255 if no range detected
-uint8_t GetTof() {
-  uint8_t range  = vl.readRange();
+// Put TOF sensor range values value into the buffer
+void Core2_GetTofSensor() {
+  uint8_t range  = vl.readRange(); /* blocking */
   uint8_t status = vl.readRangeStatus();
   // if(status==0) Serial.println(range);
   // else Serial.println("---");
   if(status != 0) range = 255;
-  return(range);
+  // wait for buffer not full - core1 needs to read a value
+  // TODO: timeout?
+  while(tofStructCnt>=TOFSTRUCT_LEN){
+    Serial.println("TOF struct full - can't write new value");
+    delay(100);
+  }
+  tofStruct[tofStructWrIdx].range = range;
+  tofStructCnt++; /* atomic */
+  if(tofStructWrIdx<TOFSTRUCT_LEN) tofStructWrIdx++;
+  else tofStructWrIdx = 0;
+}
+
+// gets current (or last) range in mm (typ 0 to 200), 255 if no range detected
+// range value is saved in global variable
+bool GetNewRange(){
+  if(tofStructCnt>0){
+    currentRange = tofStruct[tofStructRdIdx].range;
+    tofStructCnt--; /* atomic */
+    if(tofStructRdIdx<TOFSTRUCT_LEN) tofStructRdIdx++;
+    else tofStructRdIdx = 0;
+    return true;
+  } 
+  return false;
 }
 
 /////////////////// IMU ////////////////////////
-// The IMU is already instanced in the class - there can only be 1
-// Calibration offsets read during init
+// IMU read and processed in core 2
+// The IMU is instanced in the class - there can only be 1
+// Calibration offsets created during init
 float ax0=0;
 float ay0=0;
 float az0=0;
@@ -290,6 +330,10 @@ float GetVbat() {
 #define rangeWheelSpeed 100
 #define obsFRLWheelSpeed 50
 
+// 2nd core stuff
+volatile std::atomic<uint8_t> core1InitBasicsFinished = false;
+volatile std::atomic<uint8_t> core2InitFinished = false;
+
 
 void setup() {
   Serial.begin(115200);
@@ -298,15 +342,19 @@ void setup() {
   InitVbatMeas();
   InitVreg();
 
-  InitI2c();
+  // signal core2 that the basics are initialized
+  core1InitBasicsFinished = true; /* atomic */
 
   InitNeo(150,150,150);
   InitMotorDrivers();
-  InitTof();
-  InitImu();
   InitIRdet();
+
+  // wait for core2 init
+  while(!core2InitFinished) delay(1); /* atomic */
+
 }
 
+uint32_t timer0 = 0;
 void loop() {
   uint32_t t0 = millis();
   uint8_t range = 255;
@@ -327,8 +375,8 @@ void loop() {
   }
 
   det = ~GetIRdet();
-  ProcImu();
-  range = GetTof();
+  GetNewRange(); // update current range is new range is available
+  range = currentRange;
 
   int r = 150*(((det>>0)&0x0F)!=0x00);
   int g = 150*(((det>>8)&0x0F)!=0x00);
@@ -339,43 +387,106 @@ void loop() {
 
   float wheelR = 0.0;
   float wheelL = 0.0;
-  if(range<255 && range>minRange) {
-    wheelR = rangeWheelSpeed;
-    wheelL = rangeWheelSpeed;
-  }
-  
-  if((det&0x0001) == 0x0001) {
-    // front right sensor only turn right
-    wheelR -= obsFRLWheelSpeed;
-    wheelL += obsFRLWheelSpeed;
-  }
 
-  if((det&0x0002) == 0x0002) {
-    // front left sensor only turn left
-    wheelR += obsFRLWheelSpeed;
-    wheelL -= obsFRLWheelSpeed;
-  }
+  // no movement when finger over sensor opening
+  if(range>=minRange) {
+    uint16_t edgeSensors = (det&0x0F00)>>8;
+    if(edgeSensors || timer0!=0) {
+      // the edge is detected
+      if(timer0 == 0) timer0 = millis();
+      uint32_t dt = millis()-timer0;
+      // move away from edge for a bit
+      if(dt<100) {
+        if(edgeSensors&0x2) {
+          // Front Left sensor - move back and rotate CW
+          wheelR = -100.0;
+          wheelL = -50.0;
+        }
+        else if(edgeSensors&0x1) {
+          // Front Right sensor - move back and rotate CCW
+          wheelR = -50.0;
+          wheelL = -100.0;
+        }
+        else if(edgeSensors&0x8) {
+          // Rear Left sensor - move Forward and rotate CCW
+          wheelR = 50.0;
+          wheelL = 100.0;
+        }
+        else if(edgeSensors&0x4) {
+          // Rear Left sensor - move Forward and rotate CCW
+          wheelR = 100.0;
+          wheelL = 500.0;
+        }
+      } else {
+        // reset edge timer
+        timer0 = 0;
+        wheelR = 0.0;
+        wheelL = 0.0;
+      }
+    } else {
+      if(range<255) {
+        wheelR = rangeWheelSpeed;
+        wheelL = rangeWheelSpeed;
+      }
+      
+      // front sensors
+      if((det&0x0001) == 0x0001) {
+        // front right sensor only turn right
+        wheelR -= obsFRLWheelSpeed;
+        wheelL += obsFRLWheelSpeed;
+      }
+      if((det&0x0002) == 0x0002) {
+        // front left sensor only turn left
+        wheelR += obsFRLWheelSpeed;
+        wheelL -= obsFRLWheelSpeed;
+      }
+      if((det&0x0003) == 0x0003) {
+        // drive forward
+        wheelR = rangeWheelSpeed;
+        wheelL = rangeWheelSpeed;
+      }
 
-  if((det&0x0003) == 0x0003) {
-    // drive forward
-    wheelR = rangeWheelSpeed;
-    wheelL = rangeWheelSpeed;
-  }
-
-  // stop when edge is detected
-  if((det&0x0F00) != 0x0000) {
-    // front left sensor only turn left
-    wheelR = 0.0;
-    wheelL = 0.0;
+      // rear sensors
+      if(det&0x000C) {
+        // drive reverse
+        wheelR = -rangeWheelSpeed;
+        wheelL = -rangeWheelSpeed;
+      }
+      if(det&0x0004) {
+        // rear right sensor only turn right
+        wheelR += obsFRLWheelSpeed;
+        wheelL -= obsFRLWheelSpeed;
+      }
+      if(det&0x0008) {
+        // rear left sensor only turn left
+        wheelR -= obsFRLWheelSpeed;
+        wheelL += obsFRLWheelSpeed;
+      }
+    }
   }
 
   MotorDrivePct(wheelL, wheelR);
 
   uint32_t t = millis()-t0;
-//  Serial.print(t);
-
   Serial.printf("%Ld: %f, %d, %f, %f, %X\n", t, vbat, range, wheelR, wheelL, det&0x0F0F);
 
   delay(0);
 }
 
+//////////////////////////// CORE 2 ///////////////////////////////
+
+void setup1() {
+  while(!core1InitBasicsFinished) delay(1); /* atomic */
+
+  // core2 code
+  Core2_InitI2c();
+  Core2_InitTof();
+  InitImu(); // TODO: update code for core2
+  core2InitFinished = true; /* atomic */
+}
+
+void loop1(){
+  // code to put in 2nd core
+  Core2_GetTofSensor();
+  ProcImu();
+}
