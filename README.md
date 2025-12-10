@@ -35,19 +35,25 @@ The wheels and motors are made to be used together for the 10cm width on mini-su
 # Circuit modules
 ## Processor
 ## 6V regulator
-This supplies power for the processor and 3.3V regulator. The 6V output allows a protection diode while keeping the voltage above 5V</br>
 Pololu 6V, 2.7A Step-Down Voltage Regulator D36V28F6</br>
+This supplies power for the processor and 3.3V regulator. The 6V output allows a protection diode while keeping the voltage above 5V</br>
 <https://www.pololu.com/product/3783>
 
 ## 3.3V regulator
+SparkFun BabyBuck Regulator Breakout - 3.3V (AP63203)<br>
 This supplies 3.3V power to the sensors. The 3.3v from the RP2040 module does not have the current rating for the sensors.<br>
-Pololu 3.3V, 600mA Step-Down Voltage Regulator D36V6F3.<br>
-<https://www.pololu.com/product/3791><br>
+<https://www.sparkfun.com/sparkfun-babybuck-regulator-breakout-3-3v-ap63203.html><br>
 
 ## Motor driver
+
 ## Range sensor
+Adafruit VL6180X Time of Flight Distance Ranging Sensor (VL6180) - STEMMA QT<br>
+<https://www.adafruit.com/product/3316><br>
+
 ## Edge detector
+
 ## Object detector
+
 ## IMU
 
 # Circuits
