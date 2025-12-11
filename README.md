@@ -17,7 +17,7 @@ The object and edge sensors are mounted as well as wheels and motors. The motors
 ## Weight
 The weight limit is 500 grams. Without a lid it weighs in at about 225 grams.
 <img src="support/ms_weight.jpg">
-
+Hmmm the coffee shop weighed it as 295!!
 ## Motor
 FingerTech "Silver Spark" 16mm Gearmotor 50:1<br>
 <https://www.fingertechrobotics.com/proddetail.php?prod=ft-Sspark16><br>
