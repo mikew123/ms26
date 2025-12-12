@@ -42,19 +42,26 @@
 Adafruit_NeoPixel neo(1, NEO, NEO_GRB + NEO_KHZ800);
 
 bool neoRed   = 0;
-bool neoBlue  = 0;
 bool neoGreen = 0;
+bool neoBlue  = 0;
 
-void SetNeo(int r=0, int g=150, int b=0) {
-  neo.clear();
-  neo.setPixelColor(0, neo.Color(r, g, b));
-  neo.show();   // Send the updated pixel colors to the hardware.
+// update the RGB colors on the built in NEO LED
+// Only updates when colors change
+void setNeo(int r=0, int g=150, int b=0) {
+  if(r!=neoRed | g!=neoGreen | b!=neoBlue) {
+    neoRed   = r;
+    neoGreen = g;
+    neoBlue  = b;
+    neo.clear();
+    neo.setPixelColor(0, neo.Color(r, g, b));
+    neo.show();   // Send the updated pixel colors to the hardware.
+  }
 }
 
 
 void InitNeo(int r=0, int g=150, int b=0) {
   neo.begin();
-  SetNeo();
+  setNeo();
 }
 
 ///////////// Wheel motors ///////////////////
@@ -312,7 +319,7 @@ void InitVreg() {
 /////////////// VBAT measurement ////////////////
 #define VBAT_MIN 2*3.3
 #define VBAT_PIN_MAX 1023
-#define VBAT_SCALE (3.3/(15.0/(22+15)))
+#define VBAT_SCALE (3.3/(15.0/(22+15)))*(6.5/6.6)
 
 void InitVbatMeas() {
 
@@ -324,69 +331,251 @@ float GetVbat() {
   return(vbat);
 }
 
-/////////////// Movement /////////////////
-// stop before hitting for debug testing
-#define minRange 20
-#define rangeWheelSpeed 100
-#define obsFRLWheelSpeed 50
+/////////////// Sensors /////////////////
 
 // 2nd core stuff
 volatile std::atomic<uint8_t> core1InitBasicsFinished = false;
 volatile std::atomic<uint8_t> core2InitFinished = false;
 
 
-void setup() {
-  Serial.begin(115200);
-  delay(2000);
 
-  InitVbatMeas();
-  InitVreg();
+#define minRange   12
 
-  // signal core2 that the basics are initialized
-  core1InitBasicsFinished = true; /* atomic */
+#define speedFwd   100
+#define speedRev   speedFwd
+#define speedSpin  speedFwd
+#define timeSpin   ((25*1000)/speedSpin)
+#define timeBackup ((25*500)/speedRev)
+#define timeStart  5000 /* 5 sec*/
 
-  InitNeo(150,150,150);
-  InitMotorDrivers();
-  InitIRdet();
+/////////////////////// FSM for movement /////////////////////
+enum fsmState{
+INIT, IDLE0, IDLE1, WAIT_START, FWD, BACKUP, SPIN
+};
 
-  // wait for core2 init
-  while(!core2InitFinished) delay(1); /* atomic */
 
+struct {
+  // trigger input
+  bool trig = false;
+  // edge sensors
+  bool esFR = false;
+  bool esFL = false;
+  bool esRR = false;
+  bool esRL = false;
+  // object sensors
+  uint8_t range = 0; // Front Center TOF sensor
+  bool osFC = false;
+  bool osFR = false;
+  bool osFL = false;
+  bool osRR = false;
+  bool osRL = false;
+  // spin direction +/- latched based on edge sensor
+  int spinDir = 0; 
+  // state timer
+  uint32_t timer = 0;
+  // state info
+  fsmState currentState = INIT;
+  fsmState nextState = IDLE0;
+} fsmData;
+
+// Set the sensor data in the global FSM data structure
+void setFsmSensorData(uint8_t range, uint16_t det) {
+  static uint32_t timer = 0;
+  fsmData.range = range;
+  // edge sensors
+  fsmData.esFR = det&0x0100;
+  fsmData.esFL = det&0x0200;
+  fsmData.esRR = det&0x0400;
+  fsmData.esRL = det&0x0800;
+  // object sensors
+  fsmData.osFC = range!=255 && range>=minRange; // 255 is no det
+  fsmData.osFR = det&0x0001;
+  fsmData.osFL = det&0x0002;
+  fsmData.osRR = det&0x0004;
+  fsmData.osRL = det&0x0008;
+
+  // set spin direction based on the edge sensor tripped
+  if     (fsmData.esFR) fsmData.spinDir = +1;
+  else if(fsmData.esFL) fsmData.spinDir = -1;
+  else if(fsmData.esRR) fsmData.spinDir = +1;
+  else if(fsmData.esFL) fsmData.spinDir = -1;
+
+  // trigger on range < min ie. finger covers FC sensor hole
+  fsmData.trig = range<minRange;
+
+  // TODO: "filter" when finger on FC sensor for a few seconds
+  // this could help false triggers stopping the motion
+
+  // trigger is set when range<min for 5 sec and then 255
+  // reset timer when range > min including 255
+  // if(range>=minRange) {
+  //   fsmData.trig = false;
+  //   timer = millis();
+  // }
+  // else if((millis() - timer) >= 5000) {
+  //   if (!fsmData.trig) fsmData.trig = true;
+  // }
 }
 
-uint32_t timer0 = 0;
-void loop() {
-  uint32_t t0 = millis();
-  uint8_t range = 255;
-  int16_t det = 0xFFFF;
-  float vbat = 0.0;
+void fsm(float &wheelR, float &wheelL) {
+  static bool lastTrig = false;
+  bool trig0 = false;
+  bool trig1 = false;
+  // set triggers when trig value changes
+  if(fsmData.trig != lastTrig) {
+    trig1 = fsmData.trig; // finger on FC
+    trig0 = !fsmData.trig; // finger off FC
+  }
+  lastTrig = fsmData.trig;
 
-  vbat = GetVbat();
+  int r = 150*(fsmData.esFR|fsmData.esFL|fsmData.esRR|fsmData.esRL);
+  int g = 150*(fsmData.osFR|fsmData.osFL|fsmData.osRR|fsmData.osRL);
+  int b = int(150*((200-fsmData.range)/200.0));
+  if (b<0) b=0;
 
-  if(vbat<=VBAT_MIN && vbat>1.0 ) {
-    // vbat<1 is DEBUG when no battery installed
-    // remove power from sensors and motors
-    // RP2040 still active
-    // TODO: RP2040 lower power mode?
-    Serial.printf("Vbat =  %f - shutting off sensors and motors", vbat);
-    VregEnable(false);
-    delay(1000);
-    return;
+  // default motor-wheel speed 0 percent
+  wheelR = 0;
+  wheelL = 0;
+
+  bool stateChange = false;
+  if(fsmData.nextState != fsmData.currentState) {
+    stateChange = true;
+  }
+  fsmState state = fsmData.nextState;
+  fsmState nextState = state; // default no state change
+
+  // FSM
+  switch(state) {
+    case IDLE0: 
+      // wait for finger on FC to start delay before moving
+      if(trig1) {
+        nextState = IDLE1;
+      }
+      // continuous show sensor status
+      setNeo(r,g,b);
+      break;
+
+    case IDLE1: 
+      if(stateChange) {
+        setNeo(0,0,255); // BLUE
+      }
+      // wait for finger on FC to start delay before moving
+      if(trig0) {
+        nextState = WAIT_START;
+      }
+      break;
+
+    case WAIT_START: 
+      if(stateChange) {
+        // wait before moving
+        fsmData.timer = millis()+timeStart;
+        setNeo(255,0,0); // RED
+      }
+
+      if(trig1) {
+        // stop and return to idle when finger on fc
+        nextState = IDLE0;
+      }
+      else if(millis() >= fsmData.timer) {
+        // 
+        nextState = FWD;
+      }
+      break;
+    
+    case FWD: 
+      if(stateChange) {
+        setNeo(0,255,0); // GREEN
+      }
+      if(trig1) {
+        // stop and idle when finger on FC
+        nextState = IDLE0;
+      }
+      // else if(fsmData.esFR | fsmData.esFL | fsmData.esRR | fsmData.esRL) {
+      // ignore rear sensors for now - i may need a backup state for spin
+      else if(fsmData.esFR | fsmData.esFL) {
+        // edge sensor detected - brake immediately then start spin
+        // TODO: check which sensors tripped and do whatever
+        wheelR = 0;
+        wheelL = 0;
+        nextState = BACKUP;
+      } 
+      else {
+        // drive forward
+        wheelR = speedFwd;
+        wheelL = speedFwd;
+      }
+      break;
+
+    case BACKUP: 
+      if(stateChange) {
+        // backup a bit
+        fsmData.timer = millis()+timeBackup;
+        setNeo(0,0,255); // BLUE
+      }
+      if(trig1) {
+        // stop and idle when finger on FC
+        nextState = IDLE0;
+      }
+      else if(millis()>=fsmData.timer) {
+        nextState = SPIN;
+      }
+      else if(fsmData.esRR | fsmData.esRL) {
+        // react to rear edge sensors by spinning
+        nextState = SPIN;
+      }
+      else {
+        // drive reverse
+        wheelR = -speedRev;
+        wheelL = -speedRev;
+      }
+      break;
+
+    case SPIN: 
+      if(stateChange) {
+        // wait then stop spinning
+        fsmData.timer = millis()+timeSpin;
+        setNeo(150,0,150); // PURPLE
+      }
+
+      // spin away from edge before driving forward again
+      wheelR = +fsmData.spinDir*speedSpin;
+      wheelL = -fsmData.spinDir*speedSpin;
+
+      if(trig1) {
+        // stop and idle when finger on FC
+        nextState = IDLE0;
+      }
+      else if(millis()>=fsmData.timer) {
+        nextState = FWD;
+      }
+      break;
+    
+    default: 
+      setNeo(150,150,150); // WHITE
+      // stop movement - freeze in unknown state until trigger
+      wheelR = 0;
+      wheelL = 0;
+      if(trig1) {
+        nextState = IDLE0;
+      }
+      break;
   }
 
-  det = ~GetIRdet();
-  GetNewRange(); // update current range is new range is available
-  range = currentRange;
+  fsmData.nextState    = nextState;
+  fsmData.currentState = state;
+}
 
+#define rangeWheelSpeed 100
+#define obsFRLWheelSpeed 50
+
+uint32_t timer0 = 0;
+void fsmX(uint8_t range, uint16_t det, float &wheelR, float &wheelL) {
+  // display status using built in NEO LED
   int r = 150*(((det>>0)&0x0F)!=0x00);
   int g = 150*(((det>>8)&0x0F)!=0x00);
   int b = int(150*((200-range)/200.0));
   if (b<0) b=0;
-  SetNeo(r,g,b);
-
-
-  float wheelR = 0.0;
-  float wheelL = 0.0;
+  setNeo(r,g,b);
 
   // no movement when finger over sensor opening
   if(range>=minRange) {
@@ -464,11 +653,63 @@ void loop() {
       }
     }
   }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  InitVbatMeas();
+  InitVreg();
+
+  // signal core2 that the basics are initialized
+  core1InitBasicsFinished = true; /* atomic */
+
+  InitNeo(150,150,150);
+  InitMotorDrivers();
+  InitIRdet();
+
+  // wait for core2 init
+  while(!core2InitFinished) delay(1); /* atomic */
+
+}
+
+void loop() {
+  uint32_t t0 = millis();
+  uint8_t range = 255;
+  int16_t det = 0xFFFF;
+  float vbat = 0.0;
+
+  vbat = GetVbat();
+
+  if(vbat<=VBAT_MIN && vbat>1.0 ) {
+    // vbat<1 is DEBUG when no battery installed
+    // remove power from sensors and motors
+    // RP2040 still active
+    // TODO: RP2040 lower power mode?
+    Serial.printf("Vbat =  %f - shutting off sensors and motors", vbat);
+    VregEnable(false);
+    setNeo(255,0,0); // RED
+    delay(1000);
+    return;
+  }
+
+  det = ~GetIRdet(); // invert so that det bit value 1 = active
+  GetNewRange(); // update current range is new range is available
+  range = currentRange;
+
+  setFsmSensorData(range, det);
+
+  float wheelR = 0.0;
+  float wheelL = 0.0;
+
+  // fsmX(range, det, wheelR, wheelL);
+  fsm(wheelR, wheelL);
 
   MotorDrivePct(wheelL, wheelR);
 
   uint32_t t = millis()-t0;
-  Serial.printf("%Ld: %f, %d, %f, %f, %X\n", t, vbat, range, wheelR, wheelL, det&0x0F0F);
+  Serial.printf("%Ld: %f, %d, %f, %f, %X, %X\n", t, vbat, range, wheelR, wheelL, det&0x0F0F, fsmData.trig);
 
   delay(0);
 }
