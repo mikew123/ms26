@@ -419,6 +419,8 @@ void setFsmSensorData(uint8_t range, uint16_t det) {
 
 void fsm(float &wheelR, float &wheelL) {
   static bool lastTrig = false;
+  static bool esFR_latch = false;
+  static bool esFL_latch = false;
   bool trig0 = false;
   bool trig1 = false;
   // set triggers when trig value changes
@@ -484,25 +486,44 @@ void fsm(float &wheelR, float &wheelL) {
     
     case FWD: 
       if(stateChange) {
+        esFR_latch = false;
+        esFL_latch = false;
         setNeo(0,255,0); // GREEN
       }
+      // latch front edge sensors
+      esFR_latch |= fsmData.esFR;
+      esFL_latch |= fsmData.esFL;
+
       if(trig1) {
         // stop and idle when finger on FC
         nextState = IDLE0;
       }
       // else if(fsmData.esFR | fsmData.esFL | fsmData.esRR | fsmData.esRL) {
       // ignore rear sensors for now - i may need a backup state for spin
-      else if(fsmData.esFR | fsmData.esFL) {
+      else if(!fsmData.osFC && (fsmData.esFR | fsmData.esFL)) {
         // edge sensor detected - brake immediately then start spin
         // TODO: check which sensors tripped and do whatever
         wheelR = 0;
         wheelL = 0;
         nextState = BACKUP;
+//        nextState = SPIN;
+      } 
+//      else if(fsmData.osFC && (fsmData.esFR & fsmData.esFL)) {
+      else if(fsmData.osFC && (esFR_latch & esFL_latch)) {
+        // edge sensor detected - brake immediately then start spin
+        // TODO: check which sensors tripped and do whatever
+        wheelR = 0;
+        wheelL = 0;
+        nextState = BACKUP;
+//        nextState = SPIN;
       } 
       else {
         // drive forward
         wheelR = speedFwd;
         wheelL = speedFwd;
+        // Vear towards an object in front not in center
+        if(fsmData.osFR & !fsmData.osFL) wheelR *= 0.8;
+        if(fsmData.osFL & !fsmData.osFR) wheelL *= 0.8;
       }
       break;
 
@@ -546,6 +567,10 @@ void fsm(float &wheelR, float &wheelL) {
         nextState = IDLE0;
       }
       else if(millis()>=fsmData.timer) {
+        nextState = FWD;
+      }
+      else if(fsmData.osFC | fsmData.osFR | fsmData.osFL) {
+        // stop spinning when an object is detected at front
         nextState = FWD;
       }
       break;
