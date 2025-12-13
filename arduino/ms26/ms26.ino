@@ -346,8 +346,8 @@ volatile std::atomic<uint8_t> core2InitFinished = false;
 #define speedSpin  speedFwd
 #define timeSpin   ((25*1000)/speedSpin)
 #define timeBackup ((25*500)/speedRev)
-#define timeStart  5000 /* 5 sec*/
-
+#define timeStart  5000 /* 5 sec */
+#define timeFinger 1000 /* 1 second "filter" to minimize random stops */
 /////////////////////// FSM for movement /////////////////////
 enum fsmState{
 INIT, IDLE0, IDLE1, WAIT_START, FWD, BACKUP, SPIN
@@ -401,19 +401,19 @@ void setFsmSensorData(uint8_t range, uint16_t det) {
   else if(fsmData.esFL) fsmData.spinDir = -1;
 
   // trigger on range < min ie. finger covers FC sensor hole
-  // fsmData.trig = range<minRange;
-
-  // TODO: "filter" when finger on FC sensor for a few seconds
   // this could help false triggers stopping the motion
-
-  // trigger is set when range<min for 5 sec and then 255
+  // trigger is set when range<min for 1 sec and then 255
   // reset timer when range > min including 255
-  if(range>=minRange) {
+  if(range>=2*minRange) {
+    // finger not covering TOF hole
     fsmData.trig = false;
     timer = millis();
   }
-  else if(!fsmData.trig && ((millis() - timer) >= 1000)) {
-    if (!fsmData.trig) fsmData.trig = true;
+  else if(range<minRange){
+    // finger is covering TOF hole
+    if(!fsmData.trig && ((millis() - timer) >= timeFinger)) {
+      fsmData.trig = true;
+    }
   }
 }
 
@@ -430,9 +430,9 @@ void fsm(float &wheelR, float &wheelL) {
   }
   lastTrig = fsmData.trig;
 
-  int r = 150*(fsmData.esFR|fsmData.esFL|fsmData.esRR|fsmData.esRL);
-  int g = 150*(fsmData.osFR|fsmData.osFL|fsmData.osRR|fsmData.osRL);
-  int b = int(150*((200-fsmData.range)/200.0));
+  int r = 100*(fsmData.esFR|fsmData.esFL|fsmData.esRR|fsmData.esRL);
+  int g = 100*(fsmData.osFR|fsmData.osFL|fsmData.osRR|fsmData.osRL);
+  int b = int(100*((200-fsmData.range)/200.0));
   if (b<0) b=0;
 
   // default motor-wheel speed 0 percent
@@ -449,7 +449,7 @@ void fsm(float &wheelR, float &wheelL) {
   // FSM
   switch(state) {
     case IDLE0: 
-      // wait for finger on FC to start delay before moving
+      // wait for finger on FC before start sequence
       if(trig1) {
         nextState = IDLE1;
       }
@@ -461,7 +461,7 @@ void fsm(float &wheelR, float &wheelL) {
       if(stateChange) {
         setNeo(0,0,255); // BLUE
       }
-      // wait for finger on FC to start delay before moving
+      // wait for finger is off the FC to start delay before moving
       if(trig0) {
         nextState = WAIT_START;
       }
@@ -508,7 +508,6 @@ void fsm(float &wheelR, float &wheelL) {
         nextState = BACKUP;
 //        nextState = SPIN;
       } 
-//      else if(fsmData.osFC && (fsmData.esFR & fsmData.esFL)) {
       else if(fsmData.osFC && (esFR_latch & esFL_latch)) {
         // edge sensor detected - brake immediately then start spin
         // TODO: check which sensors tripped and do whatever
@@ -590,95 +589,7 @@ void fsm(float &wheelR, float &wheelL) {
   fsmData.currentState = state;
 }
 
-#define rangeWheelSpeed 100
-#define obsFRLWheelSpeed 50
 
-uint32_t timer0 = 0;
-void fsmX(uint8_t range, uint16_t det, float &wheelR, float &wheelL) {
-  // display status using built in NEO LED
-  int r = 150*(((det>>0)&0x0F)!=0x00);
-  int g = 150*(((det>>8)&0x0F)!=0x00);
-  int b = int(150*((200-range)/200.0));
-  if (b<0) b=0;
-  setNeo(r,g,b);
-
-  // no movement when finger over sensor opening
-  if(range>=minRange) {
-    uint16_t edgeSensors = (det&0x0F00)>>8;
-    if(edgeSensors || timer0!=0) {
-      // the edge is detected
-      if(timer0 == 0) timer0 = millis();
-      uint32_t dt = millis()-timer0;
-      // move away from edge for a bit
-      if(dt<100) {
-        if(edgeSensors&0x2) {
-          // Front Left sensor - move back and rotate CW
-          wheelR = -100.0;
-          wheelL = -50.0;
-        }
-        else if(edgeSensors&0x1) {
-          // Front Right sensor - move back and rotate CCW
-          wheelR = -50.0;
-          wheelL = -100.0;
-        }
-        else if(edgeSensors&0x8) {
-          // Rear Left sensor - move Forward and rotate CCW
-          wheelR = 50.0;
-          wheelL = 100.0;
-        }
-        else if(edgeSensors&0x4) {
-          // Rear Left sensor - move Forward and rotate CCW
-          wheelR = 100.0;
-          wheelL = 500.0;
-        }
-      } else {
-        // reset edge timer
-        timer0 = 0;
-        wheelR = 0.0;
-        wheelL = 0.0;
-      }
-    } else {
-      if(range<255) {
-        wheelR = rangeWheelSpeed;
-        wheelL = rangeWheelSpeed;
-      }
-      
-      // front sensors
-      if((det&0x0001) == 0x0001) {
-        // front right sensor only turn right
-        wheelR -= obsFRLWheelSpeed;
-        wheelL += obsFRLWheelSpeed;
-      }
-      if((det&0x0002) == 0x0002) {
-        // front left sensor only turn left
-        wheelR += obsFRLWheelSpeed;
-        wheelL -= obsFRLWheelSpeed;
-      }
-      if((det&0x0003) == 0x0003) {
-        // drive forward
-        wheelR = rangeWheelSpeed;
-        wheelL = rangeWheelSpeed;
-      }
-
-      // rear sensors
-      if(det&0x000C) {
-        // drive reverse
-        wheelR = -rangeWheelSpeed;
-        wheelL = -rangeWheelSpeed;
-      }
-      if(det&0x0004) {
-        // rear right sensor only turn right
-        wheelR += obsFRLWheelSpeed;
-        wheelL -= obsFRLWheelSpeed;
-      }
-      if(det&0x0008) {
-        // rear left sensor only turn left
-        wheelR -= obsFRLWheelSpeed;
-        wheelL += obsFRLWheelSpeed;
-      }
-    }
-  }
-}
 
 void setup() {
   Serial.begin(115200);
@@ -714,7 +625,7 @@ void loop() {
     // TODO: RP2040 lower power mode?
     Serial.printf("Vbat =  %f - shutting off sensors and motors", vbat);
     VregEnable(false);
-    setNeo(255,0,0); // RED
+    setNeo(50,0,0); // RED
     delay(1000);
     return;
   }
@@ -728,7 +639,6 @@ void loop() {
   float wheelR = 0.0;
   float wheelL = 0.0;
 
-  // fsmX(range, det, wheelR, wheelL);
   fsm(wheelR, wheelL);
 
   MotorDrivePct(wheelL, wheelR);
