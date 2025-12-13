@@ -401,20 +401,20 @@ void setFsmSensorData(uint8_t range, uint16_t det) {
   else if(fsmData.esFL) fsmData.spinDir = -1;
 
   // trigger on range < min ie. finger covers FC sensor hole
-  fsmData.trig = range<minRange;
+  // fsmData.trig = range<minRange;
 
   // TODO: "filter" when finger on FC sensor for a few seconds
   // this could help false triggers stopping the motion
 
   // trigger is set when range<min for 5 sec and then 255
   // reset timer when range > min including 255
-  // if(range>=minRange) {
-  //   fsmData.trig = false;
-  //   timer = millis();
-  // }
-  // else if((millis() - timer) >= 5000) {
-  //   if (!fsmData.trig) fsmData.trig = true;
-  // }
+  if(range>=minRange) {
+    fsmData.trig = false;
+    timer = millis();
+  }
+  else if(!fsmData.trig && ((millis() - timer) >= 1000)) {
+    if (!fsmData.trig) fsmData.trig = true;
+  }
 }
 
 void fsm(float &wheelR, float &wheelL) {
