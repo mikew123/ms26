@@ -91,6 +91,7 @@ The front TOF sensor has two purposes:<br>
 - Object detection<br>
     When an object is detected in front (hopefully the competitor) the robot makes sure both bottom front edge detectors are tripped before reversing and spinning.<br>
 <br>
+
 The front sensors on the left and right cause the robot to steer right or left to enable pushing the opponent better by trying to move to its center.<br> 
 
 # Code
