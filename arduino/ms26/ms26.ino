@@ -36,6 +36,29 @@
 
 #define VBAT_PIN  29
 
+// 2nd core interprocess stuff
+volatile std::atomic<bool> core1InitBasicsFinished = false;
+volatile std::atomic<bool> core2InitFinished = false;
+volatile std::atomic<bool> core2CalImu = false;
+
+// buffer TOF range data for inter-process transfer
+#define TOFSTRUCT_LEN 2
+volatile uint8_t tofStructWrIdx = 0;
+volatile uint8_t tofStructRdIdx = 0;
+volatile std::atomic<uint8_t> tofStructCnt = 0;
+volatile struct {
+  uint8_t range = 255;
+} tofStruct[TOFSTRUCT_LEN];
+
+// buffer TOF range data for inter-process transfer
+#define IMUSTRUCT_LEN 2
+volatile uint8_t imuStructWrIdx = 0;
+volatile uint8_t imuStructRdIdx = 0;
+volatile std::atomic<uint8_t> imuStructCnt = 0;
+volatile struct {
+  float yaw = 0;
+} imuStruct[IMUSTRUCT_LEN];
+
 
 ///////////////// On Board LED ////////////////////////////
 // Create led instance
@@ -128,15 +151,6 @@ void Core2_InitI2c(int hz = 100000) {
 // TOF sensor read and processed in core 2
 Adafruit_VL6180X vl = Adafruit_VL6180X();
 
-// buffer TOF range data for inter-process transfer
-#define TOFSTRUCT_LEN 2
-volatile uint8_t tofStructWrIdx = 0;
-volatile uint8_t tofStructRdIdx = 0;
-volatile std::atomic<uint8_t> tofStructCnt = 0;
-volatile struct {
-  uint8_t range = 255;
-} tofStruct[TOFSTRUCT_LEN];
-
 void Core2_InitTof() {
   Serial.println("Adafruit VL6180x TOF sensor init");
   if (! vl.begin(&Wire)) {
@@ -197,7 +211,7 @@ float gy0=0;
 float gz0=0;
 #define IMU_CAL_CNT 100
 #define IMU_DIS_CNT 100
-void core2CalImuOffsets() {
+void Core2_CalImuOffsets() {
   // discard some readings to clear out whatever
   float x, y, z;
   for(int i=0;i<IMU_DIS_CNT;i++){
@@ -234,14 +248,6 @@ void core2CalImuOffsets() {
   az0/=IMU_CAL_CNT;
 }
 
-// buffer TOF range data for inter-process transfer
-#define IMUSTRUCT_LEN 2
-volatile uint8_t imuStructWrIdx = 0;
-volatile uint8_t imuStructRdIdx = 0;
-volatile std::atomic<uint8_t> imuStructCnt = 0;
-volatile struct {
-  float yaw = 0;
-} imuStruct[IMUSTRUCT_LEN];
 uint32_t lastYawMillis = 0;
 float imuYaw = 0.0;
 
@@ -258,7 +264,7 @@ void Core2_InitImu() {
   Serial.print(IMU.gyroscopeSampleRate());
   Serial.println(" Hz");
 
-  core2CalImuOffsets();
+  Core2_CalImuOffsets();
 
   // initialize IMU data buffer
   imuStructCnt = 0; /* atomic */
@@ -378,22 +384,18 @@ float GetVbat() {
 
 /////////////// Sensors /////////////////
 
-// 2nd core stuff
-volatile std::atomic<uint8_t> core1InitBasicsFinished = false;
-volatile std::atomic<uint8_t> core2InitFinished = false;
+#define FSM_TOF_MIN_RANGE  12
+#define FSM_FWD_SPEED      100
+#define FSM_REV_SPEED      FSM_FWD_SPEED
+#define FSM_SPIN_SPEED     FSM_FWD_SPEED
+#define FSM_MAX_SPIN_TIME  1.5*((25*1000)/FSM_SPIN_SPEED)
+#define FSM_SPIN_ANGLE     100.0
+#define FSM_BACKUP_TIME    ((25*500)/FSM_REV_SPEED)
+#define FSM_TRIG_DET_TIME  1000 /* 1 second trigger "filter" to minimize random stops */
+#define FSM_START_DELAY    5000 /* 5 sec time before starting movement */
 
-
-
-#define minRange   12
-
-#define speedFwd   100
-#define speedRev   speedFwd
-#define speedSpin  speedFwd
-#define timeSpin   ((25*1000)/speedSpin)
-#define timeBackup ((25*500)/speedRev)
-#define timeStart  5000 /* 5 sec */
-#define timeFinger 1000 /* 1 second "filter" to minimize random stops */
 /////////////////////// FSM for movement /////////////////////
+
 enum fsmState{
 INIT, IDLE0, IDLE1, WAIT_START, FWD, BACKUP, SPIN
 };
@@ -416,6 +418,8 @@ struct {
   bool osRL = false;
   // spin direction +/- latched based on edge sensor
   int spinDir = 0; 
+  // yaw value when SPIN begins - used to measure SPIN angle
+  float yaw0 = 0.0;
   // state timer
   uint32_t timer = 0;
   // state info
@@ -433,7 +437,7 @@ void setFsmSensorData(uint8_t range, uint16_t det) {
   fsmData.esRR = det&0x0400;
   fsmData.esRL = det&0x0800;
   // object sensors
-  fsmData.osFC = range!=255 && range>=minRange; // 255 is no det
+  fsmData.osFC = range!=255 && range>=FSM_TOF_MIN_RANGE; // 255 is no det
   fsmData.osFR = det&0x0001;
   fsmData.osFL = det&0x0002;
   fsmData.osRR = det&0x0004;
@@ -449,14 +453,14 @@ void setFsmSensorData(uint8_t range, uint16_t det) {
   // this could help false triggers stopping the motion
   // trigger is set when range<min for 1 sec and then 255
   // reset timer when range > min including 255
-  if(range>=2*minRange) {
+  if(range>=2*FSM_TOF_MIN_RANGE) {
     // finger not covering TOF hole
     fsmData.trig = false;
     timer = millis();
   }
-  else if(range<minRange){
+  else if(range<FSM_TOF_MIN_RANGE){
     // finger is covering TOF hole
-    if(!fsmData.trig && ((millis() - timer) >= timeFinger)) {
+    if(!fsmData.trig && ((millis() - timer) >= FSM_TRIG_DET_TIME)) {
       fsmData.trig = true;
     }
   }
@@ -491,8 +495,6 @@ void fsm(float &wheelR, float &wheelL) {
   fsmState state = fsmData.nextState;
   fsmState nextState = state; // default no state change
 
-  static float yaw0 = 0;
-
   // FSM
   switch(state) {
     case IDLE0: 
@@ -517,7 +519,9 @@ void fsm(float &wheelR, float &wheelL) {
     case WAIT_START: 
       if(stateChange) {
         // wait before moving
-        fsmData.timer = millis()+timeStart;
+        fsmData.timer = millis()+FSM_START_DELAY;
+        // calibrate IMU on the mat
+        core2CalImu = true;
         setNeo(255,0,0); // RED
       }
 
@@ -565,8 +569,8 @@ void fsm(float &wheelR, float &wheelL) {
       } 
       else {
         // drive forward
-        wheelR = speedFwd;
-        wheelL = speedFwd;
+        wheelR = FSM_FWD_SPEED;
+        wheelL = FSM_FWD_SPEED;
         // Vear towards an object in front not in center
         if(fsmData.osFR & !fsmData.osFL) wheelR *= 0.8;
         if(fsmData.osFL & !fsmData.osFR) wheelL *= 0.8;
@@ -576,7 +580,7 @@ void fsm(float &wheelR, float &wheelL) {
     case BACKUP: 
       if(stateChange) {
         // backup a bit
-        fsmData.timer = millis()+timeBackup;
+        fsmData.timer = millis()+FSM_BACKUP_TIME;
         setNeo(0,0,255); // BLUE
       }
       if(trig1) {
@@ -592,22 +596,22 @@ void fsm(float &wheelR, float &wheelL) {
       }
       else {
         // drive reverse
-        wheelR = -speedRev;
-        wheelL = -speedRev;
+        wheelR = -FSM_REV_SPEED;
+        wheelL = -FSM_REV_SPEED;
       }
       break;
 
     case SPIN: 
       if(stateChange) {
         // wait then stop spinning
-        fsmData.timer = millis()+(1.5*timeSpin);
-        yaw0 = currentYaw;
+        fsmData.timer = millis()+FSM_MAX_SPIN_TIME;
+        fsmData.yaw0 = currentYaw;
         setNeo(150,0,150); // PURPLE
       }
 
       // spin away from edge before driving forward again
-      wheelR = +fsmData.spinDir*speedSpin;
-      wheelL = -fsmData.spinDir*speedSpin;
+      wheelR = +fsmData.spinDir*FSM_SPIN_SPEED;
+      wheelL = -fsmData.spinDir*FSM_SPIN_SPEED;
 
       if(trig1) {
         // stop and idle when finger on FC
@@ -616,7 +620,8 @@ void fsm(float &wheelR, float &wheelL) {
       else if(millis()>=fsmData.timer) {
         nextState = FWD;
       }
-      else if(fabs(currentYaw - yaw0) >= 100.0) {
+      else if(fabs(currentYaw - fsmData.yaw0) >= FSM_SPIN_ANGLE) {
+        // stop spinning when spin angle achieved
         nextState = FWD;
       }
       else if(fsmData.osFC | fsmData.osFR | fsmData.osFL) {
@@ -641,6 +646,7 @@ void fsm(float &wheelR, float &wheelL) {
 }
 
 
+///////////////////////////////// SETUP - LOOP //////////////////////////
 
 void setup() {
   Serial.begin(115200);
@@ -714,6 +720,12 @@ void setup1() {
 }
 
 void loop1(){
+  // calibrate IMU command from core1
+  if(core2CalImu) {
+    Core2_CalImuOffsets();
+    core2CalImu = false;
+  }
+
   // code to put in 2nd core
   Core2_GetTofSensor();
   Core2_ProcImu();
