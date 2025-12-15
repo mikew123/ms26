@@ -128,7 +128,7 @@ void Core2_InitI2c(int hz = 100000) {
 // TOF sensor read and processed in core 2
 Adafruit_VL6180X vl = Adafruit_VL6180X();
 
-// buffer range data for inter-process transfer
+// buffer TOF range data for inter-process transfer
 #define TOFSTRUCT_LEN 2
 volatile uint8_t tofStructWrIdx = 0;
 volatile uint8_t tofStructRdIdx = 0;
@@ -136,7 +136,6 @@ volatile std::atomic<uint8_t> tofStructCnt = 0;
 volatile struct {
   uint8_t range = 255;
 } tofStruct[TOFSTRUCT_LEN];
-uint8_t currentRange = 255;
 
 void Core2_InitTof() {
   Serial.println("Adafruit VL6180x TOF sensor init");
@@ -165,15 +164,17 @@ void Core2_GetTofSensor() {
     Serial.println("TOF struct full - can't write new value");
     delay(100);
   }
+  // Pass TOF data to core1
   tofStruct[tofStructWrIdx].range = range;
   tofStructCnt++; /* atomic */
   if(tofStructWrIdx<TOFSTRUCT_LEN) tofStructWrIdx++;
   else tofStructWrIdx = 0;
 }
 
-// gets current (or last) range in mm (typ 0 to 200), 255 if no range detected
+uint8_t currentRange = 255;
+// get current (or last) range in mm (typ 0 to 200), 255 if no range detected
 // range value is saved in global variable
-bool GetNewRange(){
+bool GetTofData(){
   if(tofStructCnt>0){
     currentRange = tofStruct[tofStructRdIdx].range;
     tofStructCnt--; /* atomic */
@@ -196,7 +197,7 @@ float gy0=0;
 float gz0=0;
 #define IMU_CAL_CNT 100
 #define IMU_DIS_CNT 100
-void CalImuOffsets() {
+void core2CalImuOffsets() {
   // discard some readings to clear out whatever
   float x, y, z;
   for(int i=0;i<IMU_DIS_CNT;i++){
@@ -233,7 +234,18 @@ void CalImuOffsets() {
   az0/=IMU_CAL_CNT;
 }
 
-void InitImu() {
+// buffer TOF range data for inter-process transfer
+#define IMUSTRUCT_LEN 2
+volatile uint8_t imuStructWrIdx = 0;
+volatile uint8_t imuStructRdIdx = 0;
+volatile std::atomic<uint8_t> imuStructCnt = 0;
+volatile struct {
+  float yaw = 0;
+} imuStruct[IMUSTRUCT_LEN];
+uint32_t lastYawMillis = 0;
+float imuYaw = 0.0;
+
+void Core2_InitImu() {
   Serial.println("IMU Sensor Test"); Serial.println("");
 
   /* Initialise the sensor */
@@ -246,36 +258,69 @@ void InitImu() {
   Serial.print(IMU.gyroscopeSampleRate());
   Serial.println(" Hz");
 
-  CalImuOffsets();
+  core2CalImuOffsets();
+
+  // initialize IMU data buffer
+  imuStructCnt = 0; /* atomic */
+  imuStructWrIdx = imuStructRdIdx = 0;
 }
 
-void ProcImu() {
+void Core2_ProcImu() {
   if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
-    return;
+//    return;
 
-    float x, y, z;
+    float ax, ay, az;
+    float gx, gy, gz;
 
-    IMU.readAcceleration(x, y, z);
-    x -= ax0;
-    y -= ay0;
-    z -= az0;
-    Serial.print(x*200);
-    Serial.print('\t');
-    Serial.print(y*200);
-    Serial.print('\t');
-    Serial.print(z*200);
+    IMU.readAcceleration(ax, ay, az);
+    ax -= ax0;
+    ay -= ay0;
+    az -= az0;
+    // Serial.print(ax*200);
+    // Serial.print('\t');
+    // Serial.print(ay*200);
+    // Serial.print('\t');
+    // Serial.print(az*200);
 
-    IMU.readGyroscope(x, y, z);
-    x -= gx0;
-    y -= gy0;
-    z -= gz0;
-    Serial.print('\t');
-    Serial.print(x);
-    Serial.print('\t');
-    Serial.print(y);
-    Serial.print('\t');
-    Serial.print(z);
-    Serial.println();
+    IMU.readGyroscope(gx, gy, gz);
+    gx -= gx0;
+    gy -= gy0;
+    gz -= gz0;
+    // Serial.print('\t');
+    // Serial.print(gx);
+    // Serial.print('\t');
+    // Serial.print(gy);
+    // Serial.print('\t');
+    // Serial.print(gz);
+    // Serial.println();
+
+    // Integrate angular velocity to get yaw
+    // TODO: Use usec time?
+    uint32_t currentMillis = millis();
+    float dt = (currentMillis - lastYawMillis)/1000.0;
+    lastYawMillis = currentMillis;
+    if(dt<100) {
+      // seems valid time difference integrate yaw with ang velocity
+      imuYaw += dt*gy;
+      // save into buffer for core1
+      if(imuStructCnt < IMUSTRUCT_LEN) {
+        imuStruct[imuStructWrIdx].yaw = imuYaw;
+        imuStructWrIdx++;
+        if(imuStructWrIdx >= IMUSTRUCT_LEN) imuStructWrIdx = 0;
+        imuStructCnt++;
+      }
+    }
+  }
+}
+
+float currentYaw = 0.0;
+// Get IMU data from core2
+void GetImuData(){
+  if(imuStructCnt > 0){
+    currentYaw = imuStruct[imuStructRdIdx].yaw;
+    imuStructRdIdx++;
+    if(imuStructRdIdx >= IMUSTRUCT_LEN) imuStructRdIdx = 0;
+    imuStructCnt--;
   }
 }
 
@@ -446,6 +491,8 @@ void fsm(float &wheelR, float &wheelL) {
   fsmState state = fsmData.nextState;
   fsmState nextState = state; // default no state change
 
+  static float yaw0 = 0;
+
   // FSM
   switch(state) {
     case IDLE0: 
@@ -553,7 +600,8 @@ void fsm(float &wheelR, float &wheelL) {
     case SPIN: 
       if(stateChange) {
         // wait then stop spinning
-        fsmData.timer = millis()+timeSpin;
+        fsmData.timer = millis()+(1.5*timeSpin);
+        yaw0 = currentYaw;
         setNeo(150,0,150); // PURPLE
       }
 
@@ -566,6 +614,9 @@ void fsm(float &wheelR, float &wheelL) {
         nextState = IDLE0;
       }
       else if(millis()>=fsmData.timer) {
+        nextState = FWD;
+      }
+      else if(fabs(currentYaw - yaw0) >= 100.0) {
         nextState = FWD;
       }
       else if(fsmData.osFC | fsmData.osFR | fsmData.osFL) {
@@ -631,8 +682,9 @@ void loop() {
   }
 
   det = ~GetIRdet(); // invert so that det bit value 1 = active
-  GetNewRange(); // update current range is new range is available
+  GetTofData(); // update current range is new range is available
   range = currentRange;
+  GetImuData();
 
   setFsmSensorData(range, det);
 
@@ -644,7 +696,7 @@ void loop() {
   MotorDrivePct(wheelL, wheelR);
 
   uint32_t t = millis()-t0;
-  Serial.printf("%Ld: %f, %d, %f, %f, %X, %X\n", t, vbat, range, wheelR, wheelL, det&0x0F0F, fsmData.trig);
+  Serial.printf("%Ld: %f, %d, %f, %f, %X, %f\n", t, vbat, range, wheelR, wheelL, det&0x0F0F, currentYaw);
 
   delay(0);
 }
@@ -657,12 +709,12 @@ void setup1() {
   // core2 code
   Core2_InitI2c();
   Core2_InitTof();
-  InitImu(); // TODO: update code for core2
+  Core2_InitImu(); // TODO: update code for core2
   core2InitFinished = true; /* atomic */
 }
 
 void loop1(){
   // code to put in 2nd core
   Core2_GetTofSensor();
-  ProcImu();
+  Core2_ProcImu();
 }
