@@ -428,7 +428,8 @@ float GetVbat() {
 /////////////////////// FSM for movement /////////////////////
 
 enum fsmState{
-INIT, IDLE0, IDLE1, WAIT_START, FWD, BACKUP, SPIN
+INIT, IDLE0, IDLE1, WAIT_START, 
+FWD, BACKUP, SPIN, BACKUP2, SPIN2
 };
 
 
@@ -618,7 +619,7 @@ void fsm(float &wheelR, float &wheelL) {
         // TODO: check which sensors tripped and do whatever
         wheelR = 0;
         wheelL = 0;
-        nextState = BACKUP;
+        nextState = BACKUP2;
       } 
       else {
         // drive forward
@@ -679,6 +680,55 @@ void fsm(float &wheelR, float &wheelL) {
       }
       else if(fsmData.osFC | fsmData.osFR | fsmData.osFL) {
         // stop spinning when an object is detected at front
+        nextState = FWD;
+      }
+      break;
+
+    case BACKUP2: 
+      if(stateChange) {
+        // backup a bit
+        fsmData.timer = millis()+FSM_BACKUP_TIME;
+        setNeo(0,0,255); // BLUE
+      }
+      if(trig1) {
+        // stop and idle when finger on FC
+        nextState = IDLE0;
+      }
+      else if(millis()>=fsmData.timer) {
+        nextState = SPIN2;
+      }
+      else if(fsmData.esRR | fsmData.esRL) {
+        // react to rear edge sensors by spinning
+        nextState = SPIN;
+      }
+      else {
+        // drive reverse
+        wheelR = -FSM_REV_SPEED;
+        wheelL = -FSM_REV_SPEED;
+      }
+      break;
+
+    case SPIN2: 
+      if(stateChange) {
+        // wait then stop spinning
+        fsmData.timer = millis()+FSM_MAX_SPIN_TIME;
+        fsmData.yaw0 = currentYaw;
+        setNeo(150,0,150); // PURPLE
+      }
+
+      // spin away from edge before driving forward again
+      wheelR = +fsmData.spinDir*FSM_SPIN_SPEED;
+      wheelL = -fsmData.spinDir*FSM_SPIN_SPEED;
+
+      if(trig1) {
+        // stop and idle when finger on FC
+        nextState = IDLE0;
+      }
+      else if(millis()>=fsmData.timer) {
+        nextState = FWD;
+      }
+      else if(fabs(currentYaw - fsmData.yaw0) >= FSM_SPIN_ANGLE) {
+        // stop spinning when spin angle achieved
         nextState = FWD;
       }
       break;
