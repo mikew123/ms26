@@ -441,6 +441,7 @@ struct {
   bool esFL = false;
   bool esRR = false;
   bool esRL = false;
+  bool es34 = false; // 3 or 4 edge sensors tripped, must not be on black arena
   // object sensors
   uint8_t range = 0; // Front Center TOF sensor
   bool osFC = false;
@@ -474,6 +475,14 @@ void setFsmSensorData(uint8_t range, uint16_t det) {
   fsmData.osFL = det&0x0002;
   fsmData.osRR = det&0x0004;
   fsmData.osRL = det&0x0008;
+
+  // 3 or 4 edge sensors tripped, not on black arena
+  int cnt = 0;
+  if(fsmData.esFR) cnt++;
+  if(fsmData.esFL) cnt++;
+  if(fsmData.esRR) cnt++;
+  if(fsmData.esRL) cnt++;
+  fsmData.es34 = (cnt >= 3);
 
   // set spin direction based on the edge sensor tripped
   if     (fsmData.esFR) fsmData.spinDir = +1;
@@ -521,6 +530,16 @@ void fsm(float &wheelR, float &wheelL) {
   // default motor-wheel speed 0 percent
   wheelR = 0;
   wheelL = 0;
+
+  static int es34Cnt = 0;
+  if(fsmData.es34) {
+    // 3 or 4 edge sensors tripped, must NOT be in arena
+    es34Cnt++;
+    if(es34Cnt>=100) {
+      fsmData.nextState = IDLE0;
+    }
+  }
+  else es34Cnt = 0;
 
   bool stateChange = false;
   if(fsmData.nextState != fsmData.currentState) {
