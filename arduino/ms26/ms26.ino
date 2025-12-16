@@ -50,13 +50,16 @@ volatile struct {
   uint8_t range = 255;
 } tofStruct[TOFSTRUCT_LEN];
 
-// buffer TOF range data for inter-process transfer
+// buffer IMU data for inter-process transfer
 #define IMUSTRUCT_LEN 2
 volatile uint8_t imuStructWrIdx = 0;
 volatile uint8_t imuStructRdIdx = 0;
 volatile std::atomic<uint8_t> imuStructCnt = 0;
 volatile struct {
-  float yaw = 0;
+  float yaw    = 0; // continuous angular rotation in degrees (integrate ang vel)
+  float tiltFB = 0; // +front or -back tilt, real time
+  float tiltRL = 0; // +right or -left tilt, real time
+  float hitMax = 0; // any angle hit detection, abs acceleration max
 } imuStruct[IMUSTRUCT_LEN];
 
 
@@ -211,6 +214,10 @@ float gy0=0;
 float gz0=0;
 #define IMU_CAL_CNT 100
 #define IMU_DIS_CNT 100
+
+uint32_t lastYawMillis = 0;
+float imuYaw = 0.0;
+
 void Core2_CalImuOffsets() {
   // discard some readings to clear out whatever
   float x, y, z;
@@ -231,12 +238,10 @@ void Core2_CalImuOffsets() {
       gx0+=x;
       gy0+=y;
       gz0+=z;
-
      IMU.readAcceleration(x, y, z);
       ax0+=x;
       ay0+=y;
       az0+=z;
-
       cnt++;
     }
   }
@@ -246,10 +251,10 @@ void Core2_CalImuOffsets() {
   ax0/=IMU_CAL_CNT;
   ay0/=IMU_CAL_CNT;
   az0/=IMU_CAL_CNT;
-}
 
-uint32_t lastYawMillis = 0;
-float imuYaw = 0.0;
+  // reset IMU yaw integration
+  imuYaw = 0.0;
+}
 
 void Core2_InitImu() {
   Serial.println("IMU Sensor Test"); Serial.println("");
@@ -282,23 +287,24 @@ void Core2_ProcImu() {
     ax -= ax0;
     ay -= ay0;
     az -= az0;
-    // Serial.print(ax*200);
+    // Serial.print(ax);
     // Serial.print('\t');
-    // Serial.print(ay*200);
+    // Serial.print(ay);
     // Serial.print('\t');
-    // Serial.print(az*200);
+    // Serial.print(az);
 
     IMU.readGyroscope(gx, gy, gz);
     gx -= gx0;
     gy -= gy0;
     gz -= gz0;
-    // Serial.print('\t');
-    // Serial.print(gx);
-    // Serial.print('\t');
-    // Serial.print(gy);
-    // Serial.print('\t');
-    // Serial.print(gz);
-    // Serial.println();
+
+    // Tilt detection degrees using acceleration (gravity)
+    float tiltFB = 180*asin(az)/3.14;
+    float tiltRL = 180*asin(ax)/3.14;
+    float hitMax = fabs(ax);
+    if(fabs(ay)>hitMax) hitMax = fabs(ay);
+    if(fabs(az)>hitMax) hitMax = fabs(az);
+
 
     // Integrate angular velocity to get yaw
     // TODO: Use usec time?
@@ -306,24 +312,49 @@ void Core2_ProcImu() {
     float dt = (currentMillis - lastYawMillis)/1000.0;
     lastYawMillis = currentMillis;
     if(dt<100) {
-      // seems valid time difference integrate yaw with ang velocity
+      // seems valid time difference perform integration
       imuYaw += dt*gy;
       // save into buffer for core1
       if(imuStructCnt < IMUSTRUCT_LEN) {
-        imuStruct[imuStructWrIdx].yaw = imuYaw;
+        imuStruct[imuStructWrIdx].yaw    = imuYaw;
+        imuStruct[imuStructWrIdx].tiltFB = tiltFB;
+        imuStruct[imuStructWrIdx].tiltRL = tiltRL;
+        imuStruct[imuStructWrIdx].hitMax = hitMax;
         imuStructWrIdx++;
         if(imuStructWrIdx >= IMUSTRUCT_LEN) imuStructWrIdx = 0;
         imuStructCnt++;
       }
     }
+
+    // Serial.print('\t');
+    // Serial.print(gx);
+    // Serial.print('\t');
+    // Serial.print(gy);
+    // Serial.print('\t');
+    // Serial.print(gz);
+    // Serial.print('\t');
+    // Serial.print(tiltFB);
+    // Serial.print('\t');
+    // Serial.print(tiltRL);
+    // Serial.print('\t');
+    // Serial.print(hitMax);
+    // Serial.print('\t');
+    // Serial.print(imuYaw);
+    // Serial.println();
   }
 }
 
-float currentYaw = 0.0;
+float currentYaw    = 0.0;
+float currentTiltFB = 0.0;
+float currentTiltRL = 0.0;
+float currentHitMax = 0.0;
 // Get IMU data from core2
 void GetImuData(){
   if(imuStructCnt > 0){
-    currentYaw = imuStruct[imuStructRdIdx].yaw;
+    currentYaw    = imuStruct[imuStructRdIdx].yaw;
+    currentTiltFB = imuStruct[imuStructRdIdx].tiltFB;
+    currentTiltRL = imuStruct[imuStructRdIdx].tiltRL;
+    currentHitMax = imuStruct[imuStructRdIdx].hitMax;
     imuStructRdIdx++;
     if(imuStructRdIdx >= IMUSTRUCT_LEN) imuStructRdIdx = 0;
     imuStructCnt--;
@@ -479,6 +510,8 @@ void fsm(float &wheelR, float &wheelL) {
   }
   lastTrig = fsmData.trig;
 
+  int fwdTime;
+
   int r = 100*(fsmData.esFR|fsmData.esFL|fsmData.esRR|fsmData.esRL);
   int g = 100*(fsmData.osFR|fsmData.osFL|fsmData.osRR|fsmData.osRL);
   int b = int(100*((200-fsmData.range)/200.0));
@@ -530,17 +563,19 @@ void fsm(float &wheelR, float &wheelL) {
         nextState = IDLE0;
       }
       else if(millis() >= fsmData.timer) {
-        // 
         nextState = FWD;
       }
       break;
     
     case FWD: 
       if(stateChange) {
+        fsmData.timer = millis();
         esFR_latch = false;
         esFL_latch = false;
         setNeo(0,255,0); // GREEN
       }
+      // Get a mount of time after FWD started
+      fwdTime = millis() - fsmData.timer;
       // latch front edge sensors
       esFR_latch |= fsmData.esFR;
       esFL_latch |= fsmData.esFL;
@@ -549,15 +584,34 @@ void fsm(float &wheelR, float &wheelL) {
         // stop and idle when finger on FC
         nextState = IDLE0;
       }
-      // else if(fsmData.esFR | fsmData.esFL | fsmData.esRR | fsmData.esRL) {
-      // ignore rear sensors for now - i may need a backup state for spin
+      else if(fwdTime>3000) {
+        // taking too long the robots must be tied - SPIN to break hold
+        wheelR = FSM_FWD_SPEED;
+        wheelL = FSM_FWD_SPEED;
+        nextState = SPIN;
+      }
+      else if((currentTiltFB>10)&&(fwdTime>=500)) {
+        // Ingnore lift sensors when initialy accelerating forward
+        // Front lift detection - opponent in front got under robot
+        // NOTE: front TOF sensor is not reliable enough to ensure it is in front
+        // backup then spin
+        wheelR = FSM_REV_SPEED;
+        wheelL = FSM_REV_SPEED;
+        nextState = BACKUP;
+      }
+      // else if((fabs(currentTiltFB)>2.5)||(fabs(currentTiltRL)>2.5)) {
+      //   // Tilt sensor triggered - opponent trying to lift the robot?
+      //   // Keep moving then spin immediately
+      //   wheelR = FSM_FWD_SPEED;
+      //   wheelL = FSM_FWD_SPEED;
+      //   nextState = SPIN;
+      // }
       else if(!fsmData.osFC && (fsmData.esFR | fsmData.esFL)) {
-        // edge sensor detected - brake immediately then start spin
+        // front edge sensor detected - brake immediately then start spin
         // TODO: check which sensors tripped and do whatever
         wheelR = 0;
         wheelL = 0;
         nextState = BACKUP;
-//        nextState = SPIN;
       } 
       else if(fsmData.osFC && (esFR_latch & esFL_latch)) {
         // edge sensor detected - brake immediately then start spin
@@ -565,7 +619,6 @@ void fsm(float &wheelR, float &wheelL) {
         wheelR = 0;
         wheelL = 0;
         nextState = BACKUP;
-//        nextState = SPIN;
       } 
       else {
         // drive forward
@@ -702,7 +755,8 @@ void loop() {
   MotorDrivePct(wheelL, wheelR);
 
   uint32_t t = millis()-t0;
-  Serial.printf("%Ld: %f, %d, %f, %f, %X, %f\n", t, vbat, range, wheelR, wheelL, det&0x0F0F, currentYaw);
+  Serial.printf("%Ld: %f, %d, %f, %f, %04X, %f %f\n", 
+    t, vbat, range, wheelR, wheelL, det&0x0F0F, currentYaw, currentTiltFB);
 
   delay(0);
 }
